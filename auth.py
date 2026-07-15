@@ -229,7 +229,7 @@ def register(
         )
 
     # Hash the password before storing
-    hashed_password = bcrypt.hash(password)
+    hashed_password = bcrypt_lib.hashpw(password.encode("utf-8"), bcrypt_lib.gensalt()).decode("utf-8")
 
     # New users are always "user" role by default (never super_admin)
     new_user = User(
