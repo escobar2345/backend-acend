@@ -1,7 +1,7 @@
 import os
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 import uvicorn
@@ -53,21 +53,35 @@ seed_super_admin()
 
 app = FastAPI(title="Ecommerce App with Admin Protection")
 
-allowed_origins = [
+# ─── CORS ────────────────────────────────────────────────────
+# HARD-CODED, non-negotiable origins. These are always allowed no matter
+# what environment variables are (or aren't) set on Render/Railway.
+REQUIRED_ORIGINS = [
+    "https://pressstigee.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+]
+
+# Any additional origins can still be layered on via env var, but they can
+# only ADD to the list above — they can never remove the required ones.
+extra_origins = [
     origin.strip()
-    for origin in os.getenv(
-        "ALLOWED_ORIGINS",
-        "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001",
-    ).split(",")
+    for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
 ]
+
+allowed_origins = list(dict.fromkeys(REQUIRED_ORIGINS + extra_origins))  # de-duped, order preserved
+
+# Regex covers Vercel preview-deploy URLs like prestiige-git-main-xxx.vercel.app
 allowed_origin_regex = os.getenv(
     "ALLOWED_ORIGIN_REGEX",
-    r"https://ascend-[a-z0-9-]+\.vercel\.app",
+    r"https://(prestiige|pressstigee|ascend)-[a-z0-9-]+\.vercel\.app",
 )
 
-print(f"[OK] ALLOWED ORIGINS: {allowed_origins}")
-print(f"[OK] ALLOWED ORIGIN REGEX: {allowed_origin_regex}")
+print(f"[OK] ALLOWED ORIGINS: {allowed_origins}", flush=True)
+print(f"[OK] ALLOWED ORIGIN REGEX: {allowed_origin_regex}", flush=True)
 
 # ─── Middleware (Order Matters - CORS should be first) ─────────
 app.add_middleware(
@@ -75,9 +89,10 @@ app.add_middleware(
     allow_origins=allowed_origins,
     allow_origin_regex=allowed_origin_regex,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    max_age=3600,
+    expose_headers=["*"],
+    max_age=600,
 )
 
 app.add_middleware(
@@ -85,26 +100,40 @@ app.add_middleware(
     secret_key=os.getenv("SESSION_SECRET", "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_KEY_123!"),
 )
 
-# NOTE: If you see CORS errors like:
-# "Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header"
-# then your frontend origin is not included in ALLOWED_ORIGINS.
-# Add your Next.js origin (e.g. http://localhost:3001) to python-backend/.env as ALLOWED_ORIGINS.
-
 
 @app.middleware("http")
 async def protect_admin_routes(request: Request, call_next):
+    # FIX: Allow browser CORS preflight (OPTIONS) requests to bypass authentication checks
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     path = request.url.path
     if not path.startswith("/admin"):
+        return await call_next(request)
+
+    # Function-based middleware can run before SessionMiddleware in Starlette.
+    # Let the admin route dependencies handle auth after the session is loaded.
+    if "session" not in request.scope:
+        return await call_next(request)
+
+    # EXCEPTION FOR FRONTEND API LOGIN: If your Vercel frontend is hitting the API login 
+    # endpoint programmatically, don't trap it in an HTML redirect loop.
+    if path == "/admin/auth/api/login":
         return await call_next(request)
 
     db = SessionLocal()
     try:
         user_id = request.session.get("user_id")
         if not user_id:
+            # If it's a programmatic fetch from Vercel, return an HTTP 401 instead of a 302 redirect
+            if "json" in request.headers.get("accept", "").lower():
+                return JSONResponse(status_code=401, content={"detail": "Please login to continue"})
             return RedirectResponse(url="/auth/login-page?error=Please+login+to+continue", status_code=302)
 
         user = db.query(User).filter(User.id == user_id).first()
         if not user or not user.is_super_admin():
+            if "json" in request.headers.get("accept", "").lower():
+                return JSONResponse(status_code=403, content={"detail": "Access Denied. Admins only."})
             return RedirectResponse(url="/?error=Access+Denied.+Admins+only.", status_code=302)
 
         return await call_next(request)
